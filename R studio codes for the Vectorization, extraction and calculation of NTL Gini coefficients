@@ -1,1 +1,103 @@
+# Required Libraries
+install.packages(c("sf", "terra", "raster", "dplyr", "ineq", "exactextractr"))
+library(sf)
+library(terra)
+library(raster)
+library(dplyr)
+library(ineq)
+library(exactextractr)  # For exact extraction of raster values to polygons
+library(R.utils)       # For unzipping .gz files
+library(dplyr)
+library(DescTools)
 
+# Step 1: Read the Shapefile and transform crs to 4326
+shapefile <- st_read("municipalities_with_gini.shp")
+municipalities <- st_transform(shapefile, crs = 4326)
+
+# Step 2: Read the VNL raster and reproject to EPSG:4326
+vnl_raster <- rast("VNL_v21_npp_2019_global_vcmslcfg_c202205302300.average_masked.dat.tif")
+vnl_raster <- project(vnl_raster, "EPSG:4326")
+head(vnl_raster)
+
+# Step 3: mask raster through shapefile and save for each year (have to change every time the year)
+vnl_raster <- mask(vnl_raster, vect(municipalities))
+
+# Step 4: Vectorize the VNL raster (convert to polygons)
+vnl_vector <- as.polygons(vnl_raster)
+vnl_vector <- st_as_sf(vnl_vector)                # Convert to sf object
+
+# Step 5: read pop layer and project to EPSG:4326 ##unconstrain individual https://hub.worldpop.org/geodata/listing?id=69
+population_raster <- rast("esp_ppp_2019_UNadj.tif")
+population_raster <- project(population_raster, "EPSG:4326")  # Ensure CRS consistency
+
+# Step 6: Extract population data for each VNL polygon (using the population raster)
+vnl_vector$population_sum <- exact_extract(population_raster, vnl_vector, fun = "sum")
+
+# Create a new vector by filtering out unwanted records
+vnl_vector <- vnl_vector[!is.na(vnl_vector$population_sum) & 
+                               vnl_vector$population_sum > 0 & 
+                               vnl_vector[[1]] >= 0, ]
+
+# Step 7: Calculate Lights per capita
+# Calcular logaritmo de la columna de intensidad de luz (columna 1)
+vnl_vector$light <- (vnl_vector[[1]] + 1)  # Añadir 1 para manejar valores 0 o negativos
+
+# Step 8 Calcular lights per capita (log_light / log_population)
+vnl_vector$lights_per_capita <- vnl_vector$light / vnl_vector$population_sum
+vnl_vector$log_lightsPerCa <- log(vnl_vector$lights_per_capita) 
+
+# Step 9: rasterize again
+vnl_raster <- rasterize(vnl_vector, raster(extent(vnl_vector), res = 0.01), field = "lights_per_capita", fun = mean)
+#summary(vnl_raster)
+head(vnl_raster)
+
+# Step 10: Extract raster values for each municipality polygon
+# Extract the values for each municipality polygon
+extracted_values <- raster::extract(vnl_raster, municipalities, df = TRUE)
+#head(municipalities)
+#head(extracted_values)
+extracted_values$OBJECTI <- municipalities$OBJECTI[extracted_values$ID]
+
+# Step 11 Assuming extracted_values is your data frame and `layer` is the column with the values to calculate Gini on
+gini_results <- extracted_values %>%
+  group_by(OBJECTI) %>%
+  summarise(
+    nv2_2019 = sum(layer > 0, na.rm = TRUE),  # Count of pixels with positive values in each municipality
+    V2_2019 = DescTools::Gini(layer[layer > 0], na.rm = TRUE)  # Gini index of light intensity excluding 0 and negative values
+  )
+
+# Step 12. Merge the Gini results back into the municipalities shapefile
+municipalities <- municipalities %>%
+  left_join(gini_results, by = "OBJECTI")
+#Step 12 save shapefile with new year gini
+st_write(municipalities, "municipalities_with_gini.shp", delete_layer = TRUE)
+head(municipalities)
+
+# List of columns you want to keep
+columns_to_keep <- c(
+  "CUMUN", "Pob15", "Pob16", "Pob17", "Pob18", "Pob19", "Pob20",
+  "Gn_2020", "Gn_2019", "Gn_2018", "Gn_2017", "Gn_2016", "Gn_2015",
+  "nh2_2019_y", "H2_2019_y", "nh2_2018", "H2_2018", "nh2_2017", "H2_2017",
+  "nh2_2016", "H2_2016", "nh2_2015", "H2_2015", "nh2_2020", "H2_2020",
+  "nv2_2020", "V2_2020", "nv2_2015", "V2_2015", "nv2_2016", "V2_2016",
+  "nv2_2017", "V2_2017", "nv2_2018", "V2_2018", "nv2_2019", "V2_2019"
+)
+
+# Filter out columns that don't exist in the data frame
+existing_columns <- columns_to_keep[columns_to_keep %in% names(municipalities)]
+
+# Subset the data frame with only the existing columns
+municipalities_subset <- municipalities[, existing_columns]
+
+# Rename columns
+names(municipalities_subset)[names(municipalities_subset) == "nh2_2019_y"] <- "nh2_2019"
+names(municipalities_subset)[names(municipalities_subset) == "H2_2019_y"] <- "H2_2019"
+names(municipalities_subset)[names(municipalities_subset) == "Pob15"] <- "Pob_2015"
+names(municipalities_subset)[names(municipalities_subset) == "Pob16"] <- "Pob_2016"
+names(municipalities_subset)[names(municipalities_subset) == "Pob17"] <- "Pob_2017"
+names(municipalities_subset)[names(municipalities_subset) == "Pob18"] <- "Pob_2018"
+names(municipalities_subset)[names(municipalities_subset) == "Pob19"] <- "Pob_2019"
+names(municipalities_subset)[names(municipalities_subset) == "Pob20"] <- "Pob_2020"
+
+head(municipalities_subset)
+st_write(municipalities_subset, "final_gini_analysis_11November.shp", delete_layer = TRUE)
