@@ -1,0 +1,267 @@
+# Step 0: Install and load necessary libraries
+install.packages(c("sf", "writexl", "readxl", "nlme", "lme4", "performance", "ggplot2", "gridExtra"))
+library(tidyverse)
+library(writexl)
+library(readxl)
+library(nlme)
+library(lme4)
+library(performance)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+library(sf)
+
+#######PANEL REGRESSION (TABLE 3 AND FIGURE 3)
+# Step 1: Load the shapefile data
+dataset <- st_read("Dataset_Gini_Pob_2015_2020.shp")
+
+# Step 2: Create separate data frames for Tax (income data), Viirs, Harmo, VIIRS N, Harmo N, and Popolation
+tax_data <- data %>% select(CUMUN, starts_with("Gn_"))
+viirs_data <- data %>% select(CUMUN, starts_with("V2_"))
+harmo_data <- data %>% select(CUMUN, starts_with("H2_"))
+nv_data <- data %>% select(CUMUN, starts_with("nv2_"))
+nh_data <- data %>% select(CUMUN, starts_with("nh2_"))
+pob_data <- data %>% select(CUMUN, starts_with("Pob_"))
+
+# Step 3: Reshape each data frame to long format
+long_tax <- tax_data %>% pivot_longer(cols = starts_with("Gn_"), names_to = "Year", names_prefix = "Gn_", values_to = "Tax") %>% mutate(Year = as.numeric(Year))
+long_viirs <- viirs_data %>% pivot_longer(cols = starts_with("V2_"), names_to = "Year", names_prefix = "V2_", values_to = "Viirs") %>% mutate(Year = as.numeric(Year))
+long_harmo <- harmo_data %>% pivot_longer(cols = starts_with("H2_"), names_to = "Year", names_prefix = "H2_", values_to = "Harmo") %>% mutate(Year = as.numeric(Year))
+long_nv <- nv_data %>% pivot_longer(cols = starts_with("nv2_"), names_to = "Year", names_prefix = "nv2_", values_to = "nv") %>% mutate(Year = as.numeric(Year))
+long_nh <- nh_data %>% pivot_longer(cols = starts_with("nh2_"), names_to = "Year", names_prefix = "nh2_", values_to = "nh") %>% mutate(Year = as.numeric(Year))
+long_pob <- pob_data %>% pivot_longer(cols = starts_with("Pob_"), names_to = "Year", names_prefix = "Pob_", values_to = "pob") %>% mutate(Year = as.numeric(Year))
+
+# Step 4: Drop geometry from spatial data
+long_viirs <- st_drop_geometry(long_viirs)
+long_harmo <- st_drop_geometry(long_harmo)
+long_nh <- st_drop_geometry(long_nh)
+long_pob <- st_drop_geometry(long_pob)
+long_nv <- st_drop_geometry(long_nv)
+
+# Step 5: Merge the reshaped data frames
+long_merged_data <- long_tax %>%
+  left_join(long_viirs, by = c("CUMUN", "Year")) %>%
+  left_join(long_harmo, by = c("CUMUN", "Year")) %>%
+  left_join(long_nh, by = c("CUMUN", "Year")) %>%
+  left_join(long_pob, by = c("CUMUN", "Year")) %>%
+  left_join(long_nv, by = c("CUMUN", "Year"))
+
+#############
+
+# Step 6: Fit the panel regression model with random slopes (TABLE 3)
+long_merged_data$CUMUN <- as.factor(long_merged_data$CUMUN)
+long_merged_data$Year <- as.factor(long_merged_data$Year)
+
+model_temporal_random_slopes_viirs <- lme(Tax ~ Viirs, 
+                                    data = long_merged_data, 
+                                    random = ~ Viirs | CUMUN,  
+                                    correlation = corGaus(form = ~ Year | CUMUN),
+                                    method = "ML", 
+                                    na.action = na.omit)
+
+model_temporal_random_slopes_harmo <- lme(Tax ~ Harmo, 
+                                    data = long_merged_data, 
+                                    random = ~ Harmo | CUMUN,  
+                                    correlation = corGaus(form = ~ Year | CUMUN),
+                                    method = "ML", 
+                                    na.action = na.omit)
+
+summary(model_temporal_random_slopes_viirs)
+summary(model_temporal_random_slopes_harmo)
+
+# Step 7: Calculate R-squared for the model (TABLE 3)
+r2_values <- r2(model_temporal_random_slopes_viirs)
+Conditional_R2 <- r2_values$R2_conditional
+Marginal_R2 <- r2_values$R2_marginal
+cat("Conditional R2:", Conditional_R2, "\n")
+cat("Marginal R2:", Marginal_R2, "\n")
+
+
+# Step 8: Create and prepare the Viirs and Harmonized adjusted intercepts and slopes for PLOTTING (FIGURE 3 for viirs)
+# Extract random effects (adjusted intercepts and slopes) for Viirs
+random_effects_viirs <- ranef(model_temporal_random_slopes_viirs)
+fixed_intercept_viirs <- 27.847792
+fixed_viirs_effect <- 4.325793
+
+adjusted_intercept_viirs <- fixed_intercept_viirs + random_effects_viirs[, "(Intercept)"]
+adjusted_viirs_effect <- fixed_viirs_effect + random_effects_viirs[, "Viirs"]
+
+# Step 9: Combine adjusted effects with population categories for Viirs
+adjusted_effects_viirs <- data.frame(
+  CUMUN = as.integer(rownames(random_effects_viirs)),
+  Adjusted_Intercept = adjusted_intercept_viirs,
+  Adjusted_Viirs_Effect = adjusted_viirs_effect
+)
+
+# Step 10 Create population categories for Viirs
+data_adapted_viirs <- data %>%
+  mutate(pop_category_1 = case_when(
+    Pob_2020 <= 2000 ~ "<= 2",
+    Pob_2020 > 2000 & Pob_2020 <= 10000 ~ "2 - 10",
+    Pob_2020 > 10000 & Pob_2020 <= 50000 ~ "10 - 50",
+    Pob_2020 > 50000 & Pob_2020 <= 100000 ~ "50 - 100",
+    Pob_2020 > 100000 & Pob_2020 <= 250000 ~ "100 - 250",
+    Pob_2020 > 250000 ~ "> 250",
+    TRUE ~ NA_character_  
+  )) %>%
+  mutate(pop_category_1 = fct_relevel(pop_category_1, "<= 2", "2 - 10", "10 - 50", "50 - 100", "100 - 250", "> 250"))
+
+# Step 11 Ensure both datasets have matching CUMUN types (Viirs)
+data_adapted_viirs$CUMUN <- as.integer(data_adapted_viirs$CUMUN)
+
+# Step 12 Merge adjusted effects with population categories (Viirs)
+merged_data_viirs <- left_join(adjusted_effects_viirs, data_adapted_viirs[, c("CUMUN", "pop_category_1")], by = "CUMUN") %>%
+  filter(!is.na(Adjusted_Intercept) & !is.na(Adjusted_Viirs_Effect) & !is.na(pop_category_1) & pop_category_1 != "Unknown")
+
+# Step 13: Create boxplots for adjusted intercepts and slopes (Viirs)
+plot_intercept_viirs <- ggplot(merged_data_viirs, aes(x = pop_category_1, y = Adjusted_Intercept, color = pop_category_1)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(x = "Population size (thousands)", y = "Intercept") +
+  ggtitle("Viirs Gini") +  # Title added
+  theme(plot.title = element_text(size = 10)) +  # Title size set to 8
+  scale_color_grey() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  scale_x_discrete(limits = levels(merged_data_viirs$pop_category_1))
+
+plot_slope_viirs <- ggplot(merged_data_viirs, aes(x = pop_category_1, y = Adjusted_Viirs_Effect, color = pop_category_1)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(x = "Population size (thousands)", y = "Slope") +
+  ggtitle("Viirs Gini") +  # Title added
+  theme(plot.title = element_text(size = 10)) +  # Title size set to 8
+  scale_color_grey() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  scale_x_discrete(limits = levels(merged_data_viirs$pop_category_1))
+
+### Step 14: Extract random effects (adjusted intercepts and slopes) for Harmonized (FIGURE 3 for Harmonized)
+random_effects_harmo <- ranef(model_temporal_random_slopes_harmo)
+fixed_intercept_harmo <- 28.933311
+fixed_harmo_effect <- 2.413413
+
+adjusted_intercept_harmo <- fixed_intercept_harmo + random_effects_harmo[, "(Intercept)"]
+adjusted_harmo_effect <- fixed_harmo_effect + random_effects_harmo[, "Harmo"]
+
+# Step 15: Combine adjusted effects with population categories for Harmonized
+adjusted_effects_harmo <- data.frame(
+  CUMUN = as.integer(rownames(random_effects_harmo)),
+  Adjusted_Intercept = adjusted_intercept_harmo,
+  Adjusted_Harmo_Effect = adjusted_harmo_effect
+)
+
+# Step 16 Create population categories for Harmonized
+data_adapted_harmo <- data %>%
+  mutate(pop_category_1 = case_when(
+    Pob_2020 <= 2000 ~ "<= 2",
+    Pob_2020 > 2000 & Pob_2020 <= 10000 ~ "2 - 10",
+    Pob_2020 > 10000 & Pob_2020 <= 50000 ~ "10 - 50",
+    Pob_2020 > 50000 & Pob_2020 <= 100000 ~ "50 - 100",
+    Pob_2020 > 100000 & Pob_2020 <= 250000 ~ "100 - 250",
+    Pob_2020 > 250000 ~ "> 250",
+    TRUE ~ NA_character_  
+  )) %>%
+  mutate(pop_category_1 = fct_relevel(pop_category_1, "<= 2", "2 - 10", "10 - 50", "50 - 100", "100 - 250", "> 250"))
+
+# Step 17 Ensure both datasets have matching CUMUN types (Harmonized)
+data_adapted_harmo$CUMUN <- as.integer(data_adapted_harmo$CUMUN)
+
+# Step 18 Merge adjusted effects with population categories (Harmonized)
+merged_data_harmo <- left_join(adjusted_effects_harmo, data_adapted_harmo[, c("CUMUN", "pop_category_1")], by = "CUMUN") %>%
+  filter(!is.na(Adjusted_Intercept) & !is.na(Adjusted_Harmo_Effect) & !is.na(pop_category_1) & pop_category_1 != "Unknown")
+
+# Step 19: Create boxplots for adjusted intercepts and slopes (Harmonized)
+plot_intercept_harmo <- ggplot(merged_data_harmo, aes(x = pop_category_1, y = Adjusted_Intercept, color = pop_category_1)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(x = "Population size (thousands)", y = "Intercept") +
+  ggtitle("Harmonized Gini") +  # Title added
+  theme(plot.title = element_text(size = 10)) +  # Title size set to 8
+  scale_color_grey() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  scale_x_discrete(limits = levels(merged_data_harmo$pop_category_1))
+
+plot_slope_harmo <- ggplot(merged_data_harmo, aes(x = pop_category_1, y = Adjusted_Harmo_Effect, color = pop_category_1)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(x = "Population size (thousands)", y = "Slope") +
+  ggtitle("Harmonized Gini") +  # Title added
+  theme(plot.title = element_text(size = 10)) +  # Title size set to 8
+  scale_color_grey() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  scale_x_discrete(limits = levels(merged_data_harmo$pop_category_1))
+
+# Step 20: Arrange all plots in a single figure with grid.arrange
+grid.arrange(plot_intercept_viirs, plot_slope_viirs, plot_intercept_harmo, plot_slope_harmo, nrow = 2)
+library(gridExtra)
+library(ggplot2)
+
+# Step 21 Arrange the plots in a grid
+combined_plot <- grid.arrange(plot_intercept_viirs, plot_slope_viirs, 
+                              plot_intercept_harmo, plot_slope_harmo, nrow = 2)
+
+# Step 22 Save the arranged plot
+ggsave(
+  filename = "Figure 6_Intercept_slope_plots.png",  # File name
+  plot = combined_plot,                            # Use the combined plot
+  device = "png",                                  # Save as PNG format
+  width = 18.3,                                    # Width in cm (double column, ~7.2 inches)
+  height = 12.47,                                  # Height in cm (adjusted for aspect ratio, ~4.9 inches)
+  dpi = 300,                                       # Resolution (300 dpi for Scientific Reports)
+  units = "cm"                                     # Measurement units
+)
+###getting a formatted table
+# Step 23 Load necessary libraries
+library(formattable)
+
+# Create a data frame for the table with added Conditional R² row
+model_comparison <- data.frame(
+  Statistic = c("AIC", "BIC", "logLik", "Intercept", "Predictor Estimate", 
+                "Std. Error (Predictor)", "Random Effect (Intercept)", 
+                "Random Effect (Predictor)", "Residual Std. Dev", 
+                "Range Parameter", "Conditional R²", "Observations", "Groups"),
+  Viirs_Model = c(168362, 168421.9, -84173.99, 27.85, 4.33, 0.1354, 
+                  3.44, 5.03, 1.86, 1.1808, 0.7514, 38591, 6610),
+  Harmo_Model = c(169300.6, 169360.5, -84643.3, 28.93, 2.41, 0.1300, 
+                  3.10, 3.95, 1.83, 1.0884, 0.7316, 38585, 6609)
+)
+
+# Step 24 Format the Viirs_Model and Harmo_Model columns to have the correct decimals
+model_comparison$Viirs_Model <- mapply(function(x, stat) {
+  if (stat %in% c("Groups", "Observations")) {
+    return(formatC(x, format = "f", digits = 0))  # No decimals for 'Groups' and 'Observations'
+  } else {
+    return(formatC(x, format = "f", digits = 3))  # 3 decimals for other values
+  }
+}, model_comparison$Viirs_Model, model_comparison$Statistic)
+
+model_comparison$Harmo_Model <- mapply(function(x, stat) {
+  if (stat %in% c("Groups", "Observations")) {
+    return(formatC(x, format = "f", digits = 0))  # No decimals for 'Groups' and 'Observations'
+  } else {
+    return(formatC(x, format = "f", digits = 3))  # 3 decimals for other values
+  }
+}, model_comparison$Harmo_Model, model_comparison$Statistic)
+
+# Step 25 Define red formatting specifically for "Intercept", "Predictor Estimate" and "Conditional R²"
+red_formatter <- formatter("span", 
+                           style = ~ style(color = "red", font.weight = "bold"))
+
+# Step 26 Create the formattable table with custom formatting
+formattable_table <- formattable(model_comparison, list(
+  # Apply bold to column names
+  Statistic = formatter("span", style = ~ style(font.weight = "bold")),
+  
+  # Apply red_formatter specifically for Intercept, Predictor Estimate, and Conditional R²
+  Viirs_Model = formatter("span", 
+                          style = ~ ifelse(Statistic %in% c("Intercept", "Predictor Estimate", "Conditional R²"),
+                                           style(color = "red", font.weight = "bold"),
+                                           style(color = "black"))),
+  
+  Harmo_Model = formatter("span", 
+                          style = ~ ifelse(Statistic %in% c("Intercept", "Predictor Estimate", "Conditional R²"),
+                                           style(color = "red", font.weight = "bold"),
+                                           style(color = "black")))
+))
+
+# Step 27Print the table
+formattable_table
